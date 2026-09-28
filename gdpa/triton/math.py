@@ -162,6 +162,7 @@ if is_mtia():
     @triton.jit  # pragma: no cover
     def gelu(x):
         return libdevice.gelu(x)
+
 else:
 
     @triton.jit  # pragma: no cover
@@ -174,6 +175,7 @@ if is_mtia():
     @triton.jit  # pragma: no cover
     def gelu_grad(x):
         return libdevice.dgelu(x)
+
 else:
 
     @triton.jit  # pragma: no cover
@@ -374,7 +376,7 @@ def hardswish(x):
     six = 6.0
     three = 3.0
     inv_six = 1.0 / 6.0
-    t = tl.minimum(tl.maximum(x + three.to(x.dtype), zero.to(x.dtype)), six.to(x.dtype))
+    t = tl.clamp(x + three.to(x.dtype), zero.to(x.dtype), six.to(x.dtype))
     return x * t * inv_six.to(x.dtype)
 
 
