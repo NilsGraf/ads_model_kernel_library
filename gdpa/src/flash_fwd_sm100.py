@@ -98,7 +98,9 @@ class TmemLayout:
         - SF1 at P0 + P_size = ~96 (in S0 region) - for S1 GEMM
     """
 
-    def __init__(self, n_block_size: int, head_dim_v_padded: int, q_stage: int = 2):
+    def __init__(
+        self, n_block_size: int, head_dim_v_padded: int, q_stage: int = 2
+    ) -> None:
         self.n_block_size = n_block_size
         self.head_dim_v_padded = head_dim_v_padded
         self.q_stage = q_stage
@@ -339,7 +341,7 @@ class FlashAttentionForwardSm100:
         """
         return 4 if self.q_dtype.width >= 16 else 2
 
-    def _setup_attributes(self):
+    def _setup_attributes(self) -> None:
         """Set up configurations and parameters for the FMHA kernel operation.
 
         This method initializes and configures various attributes required for the
@@ -404,7 +406,7 @@ class FlashAttentionForwardSm100:
         # When provided, SF layout uses this instead of deriving from mQ/mK.shape
         total_sf_q: Int32 | int | None = None,
         total_sf_k: Int32 | int | None = None,
-    ):
+    ) -> None:
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
         This method prepares the input tensors for processing, validates their shapes and types,
@@ -2660,7 +2662,7 @@ class FlashAttentionForwardSm100:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         sSFP: Optional[cute.Tensor] = None,  # P's scale factors for blockscaled MXFP8
-    ):
+    ) -> None:
         """Compute softmax on attention scores from QK matrix multiplication.
 
         This method handles the softmax computation for either the first or second half of the
@@ -3012,7 +3014,7 @@ class FlashAttentionForwardSm100:
         thread_idx: Int32,
         # scale: Float32,
         sO: cute.Tensor,
-    ):
+    ) -> None:
         """Apply final scaling and transformation to attention output before writing to global memory.
 
         This correction_epilogue function handles the final processing step for attention output values.
@@ -3111,7 +3113,7 @@ class FlashAttentionForwardSm100:
         mbar_ptr: cute.Pointer,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
-    ):
+    ) -> None:
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -3246,7 +3248,7 @@ class FlashAttentionForwardSm100:
         tma_atom_SFQ: Optional[cute.CopyAtom] = None,
         tSFQgSFQ: Optional[cute.Tensor] = None,
         tSFQsSFQ: Optional[cute.Tensor] = None,
-    ):
+    ) -> None:
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -3287,7 +3289,7 @@ class FlashAttentionForwardSm100:
         tma_atom_SFV: Optional[cute.CopyAtom] = None,
         tSFVgSFV: Optional[cute.Tensor] = None,
         tSFVsSFV: Optional[cute.Tensor] = None,
-    ):
+    ) -> None:
         assert K_or_V in ("K", "V")
         tma_copy_bytes = (
             self.tma_copy_k_bytes
@@ -3350,7 +3352,9 @@ class FlashAttentionForwardSm100:
             )
 
     @cute.jit
-    def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):
+    def offset_kv_smem(
+        self, sX: cute.Tensor, stage: Int32, phase: Int32
+    ) -> cute.Tensor:
         if const_expr(self.uneven_kv_smem):
             # smem layout is [smem_large, smem_small, smem_large], and the current stride is
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
@@ -3360,7 +3364,9 @@ class FlashAttentionForwardSm100:
         else:
             return sX
 
-    def make_and_init_load_kv_pipeline(self, load_kv_mbar_ptr):
+    def make_and_init_load_kv_pipeline(
+        self, load_kv_mbar_ptr
+    ) -> cutlass.pipeline.PipelineTmaUmma:
         load_kv_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
         )
