@@ -45,7 +45,7 @@ class ParamsBase:
     parameters to compiled GPU kernels.
     """
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         all_fields = [getattr(self, field.name) for field in fields(self)]
         non_constexpr_fields = [
             f for f in all_fields if not isinstance(f, cutlass.Constexpr)
@@ -57,7 +57,7 @@ class ParamsBase:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "ParamsBase":
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
         constexpr_fields = {
             n: f for n, f in all_fields.items() if isinstance(f, cutlass.Constexpr)
@@ -156,13 +156,15 @@ class SingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         return cutlass.utils.WorkTileInfo(self._blk_coord, self._is_first_block)
 
-    def initial_work_tile_info(self, *, loc=None, ip=None):
+    def initial_work_tile_info(
+        self, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
+    def prefetch_next_work(self, *, loc=None, ip=None) -> None:
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None) -> None:
         self._is_first_block = False
 
     def __extract_mlir_values__(self) -> list:
@@ -173,7 +175,7 @@ class SingleTileScheduler:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "SingleTileScheduler":
         obj_list = []
         for obj, n_items in zip([self._blk_coord], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
@@ -205,7 +207,7 @@ class StaticPersistentTileScheduler:
                 total_blocks,
             )
 
-    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None) -> None:
         self.params = params
         self._tile_idx = tile_idx
         self._loc = loc
@@ -245,16 +247,18 @@ class StaticPersistentTileScheduler:
             (Int32(block_idx), Int32(head_idx), Int32(batch_idx)), is_valid
         )
 
-    def initial_work_tile_info(self, *, loc=None, ip=None):
+    def initial_work_tile_info(
+        self, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
+    def prefetch_next_work(self, *, loc=None, ip=None) -> None:
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None) -> None:
         self._tile_idx += cute.arch.grid_dim()[0]
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -389,7 +393,7 @@ class SingleTileLPTScheduler:
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._tile_idx = self.params.total_blocks
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -397,7 +401,7 @@ class SingleTileLPTScheduler:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "SingleTileLPTScheduler":
         obj_list = []
         for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
@@ -611,17 +615,19 @@ class SingleTileVarlenScheduler:
             (Int32(block), Int32(head_idx), Int32(batch_idx)), is_valid
         )
 
-    def initial_work_tile_info(self, *, loc=None, ip=None):
+    def initial_work_tile_info(
+        self, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
+    def prefetch_next_work(self, *, loc=None, ip=None) -> None:
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None) -> None:
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._is_first_block = False
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -629,7 +635,7 @@ class SingleTileVarlenScheduler:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "SingleTileVarlenScheduler":
         obj_list = []
         for obj, n_items in zip(
             [self.params, self._tile_idx],
@@ -764,17 +770,19 @@ class SingleTileVarlenSchedulerSimple:
         )
         return cutlass.utils.WorkTileInfo(self._blk_coord, is_valid)
 
-    def initial_work_tile_info(self, *, loc=None, ip=None):
+    def initial_work_tile_info(
+        self, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
         return self.get_current_work(loc=loc, ip=ip)
 
     def prefetch_next_work(self, *, loc=None, ip=None) -> None:
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None) -> None:
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._is_first_block = False
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         values, self._values_pos = [], []
         for obj in [self.params, self._blk_coord]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -782,7 +790,7 @@ class SingleTileVarlenSchedulerSimple:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "SingleTileVarlenSchedulerSimple":
         obj_list = []
         for obj, n_items in zip(
             [self.params, self._blk_coord],
@@ -895,7 +903,9 @@ class SingleTileVarlenSchedulerPersistent:
             (Int32(block), Int32(head_idx), Int32(batch_idx)), is_valid
         )
 
-    def initial_work_tile_info(self, *, loc=None, ip=None):
+    def initial_work_tile_info(
+        self, *, loc=None, ip=None
+    ) -> cutlass.utils.WorkTileInfo:
         return self.get_current_work(loc=loc, ip=ip)
 
     def prefetch_next_work(self, *, loc=None, ip=None) -> None:
@@ -904,7 +914,7 @@ class SingleTileVarlenSchedulerPersistent:
     def advance_to_next_work(self, *, loc=None, ip=None) -> None:
         self._tile_idx += cute.arch.grid_dim()[0]
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> list[object]:
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -912,7 +922,7 @@ class SingleTileVarlenSchedulerPersistent:
             self._values_pos.append(len(obj_values))
         return values
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values) -> "SingleTileVarlenSchedulerPersistent":
         obj_list = []
         for obj, n_items in zip(
             [self.params, self._tile_idx],
