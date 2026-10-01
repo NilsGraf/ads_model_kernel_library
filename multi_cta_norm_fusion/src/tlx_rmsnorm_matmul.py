@@ -1580,17 +1580,20 @@ def matmul_kernel_tma_ws_blackwell(  # noqa: C901
 ):
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
+    buffers_A_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
     if not A_ROW_MAJOR:
         buffers_A = tlx.local_alloc(
             (BLOCK_SIZE_K, BLOCK_M_SPLIT),
             tlx.dtype_of(a_desc),
             NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+            reuse=buffers_A_alias,
         )
     else:
         buffers_A = tlx.local_alloc(
             (BLOCK_M_SPLIT, BLOCK_SIZE_K),
             tlx.dtype_of(a_desc),
             NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+            reuse=buffers_A_alias,
         )
     # Separate SMEM alias for epilogue's local_load of A (avoids MMA layout penalty)
     if FUSED_RMSNORM:
@@ -1599,15 +1602,22 @@ def matmul_kernel_tma_ws_blackwell(  # noqa: C901
                 (BLOCK_SIZE_K, BLOCK_M_SPLIT),
                 tlx.dtype_of(a_desc),
                 NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-                reuse=buffers_A,
+                reuse=buffers_A_alias,
             )
         else:
             buffers_A_epi = tlx.local_alloc(
                 (BLOCK_M_SPLIT, BLOCK_SIZE_K),
                 tlx.dtype_of(a_desc),
                 NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-                reuse=buffers_A,
+                reuse=buffers_A_alias,
             )
+        buffers_A_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                buffers_A,
+                buffers_A_epi,
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
     else:
         buffers_A_epi = None
     # In 2-CTA mode, each CTA only needs to load BLOCK_N // NUM_CTAS of B.

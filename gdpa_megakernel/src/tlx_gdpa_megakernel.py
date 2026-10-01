@@ -819,8 +819,14 @@ def gdpa_kernel_tma_ws_blackwell(
     # allocate buffers for k, v
     kv_buf = tlx.local_alloc((BLOCK_N, BLOCK_D), dtype, NUM_BUFFERS_KV)  # k
     if not MERGE_EPI:
-        o0_smem = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1)
-        o1_smem = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1)
+        o0_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+        o1_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+        o0_smem = tlx.local_alloc(
+            (BLOCK_M // 2, HEAD_DIM), dtype, 1, reuse=o0_storage_alias
+        )
+        o1_smem = tlx.local_alloc(
+            (BLOCK_M // 2, HEAD_DIM), dtype, 1, reuse=o1_storage_alias
+        )
         o0_smem_fulls = tlx.alloc_barriers(num_barriers=1)
         o1_smem_fulls = tlx.alloc_barriers(num_barriers=1)
         o0_smem_empties = tlx.alloc_barriers(num_barriers=1)
@@ -828,50 +834,124 @@ def gdpa_kernel_tma_ws_blackwell(
     # Residual buffers reuse o_smem: Load warp -> Act warp, then Act stores
     # output back to the same physical buffer for Epilogue warp.
     if FUSED_RESIDUAL_ADD:
-        res0_buf = tlx.local_alloc((BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o0_smem)
-        res1_buf = tlx.local_alloc((BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o1_smem)
+        res0_buf = tlx.local_alloc(
+            (BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o0_storage_alias
+        )
+        res1_buf = tlx.local_alloc(
+            (BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o1_storage_alias
+        )
         res0_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         res0_empties = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         res1_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         res1_empties = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
 
     if STORE_RMS_NORM_OUT:
-        y_smem0 = tlx.local_alloc((BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o0_smem)
-        y_smem1 = tlx.local_alloc((BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o1_smem)
+        y_smem0 = tlx.local_alloc(
+            (BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o0_storage_alias
+        )
+        y_smem1 = tlx.local_alloc(
+            (BLOCK_M // 2, BLOCK_D), dtype, 1, reuse=o1_storage_alias
+        )
         y_smem0_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         y_smem0_empties = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         y_smem1_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         y_smem1_empties = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    # o_smem, res, and y_smem fully overlap whenever defined (legacy reuse
+    # placed each of them at offset 0 of the o_smem backing).
+    if not MERGE_EPI:
+        if FUSED_RESIDUAL_ADD:
+            if STORE_RMS_NORM_OUT:
+                o0_storage_alias.set_buffer_overlap(
+                    tlx.reuse_group(
+                        o0_smem,
+                        res0_buf,
+                        y_smem0,
+                        group_type=tlx.reuse_group_type.shared,
+                    )
+                )
+                o1_storage_alias.set_buffer_overlap(
+                    tlx.reuse_group(
+                        o1_smem,
+                        res1_buf,
+                        y_smem1,
+                        group_type=tlx.reuse_group_type.shared,
+                    )
+                )
+            else:
+                o0_storage_alias.set_buffer_overlap(
+                    tlx.reuse_group(
+                        o0_smem, res0_buf, group_type=tlx.reuse_group_type.shared
+                    )
+                )
+                o1_storage_alias.set_buffer_overlap(
+                    tlx.reuse_group(
+                        o1_smem, res1_buf, group_type=tlx.reuse_group_type.shared
+                    )
+                )
+        elif STORE_RMS_NORM_OUT:
+            o0_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    o0_smem, y_smem0, group_type=tlx.reuse_group_type.shared
+                )
+            )
+            o1_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    o1_smem, y_smem1, group_type=tlx.reuse_group_type.shared
+                )
+            )
 
     # allocate tmem for outputs of 4 dots (after partitioning)
     # qk0 = q0 @ k, qk1 = q1 @ k, p0 = act (qk0), p1 = act (qk1)
     # acc0 = p0 @ v, acc1 = p1 @ v
+    # P (subtiled 1x -> NUM_SUBSLICES buffers) shares its QK backing. The
+    # group_size tree below is only valid for single-buffered QK with <= 2
+    # slices (wider subtiling overflows the tree's index math); other
+    # configs keep the legacy identity layout via a bare spec.
+    qk0_p0_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    qk1_p1_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk0_buf = tlx.local_alloc(
         (BLOCK_M // 2, BLOCK_N),
         tl.float32,
         1,
         tlx.storage_kind.tmem,
+        reuse=qk0_p0_storage_alias,
     )
     qk1_buf = tlx.local_alloc(
         (BLOCK_M // 2, BLOCK_N),
         tl.float32,
         1,
         tlx.storage_kind.tmem,
+        reuse=qk1_p1_storage_alias,
     )
     p0_buf = tlx.local_alloc(
         (BLOCK_M // 2, BLOCK_N // NUM_SUBSLICES),
         dtype,
         NUM_SUBSLICES,
         tlx.storage_kind.tmem,
-        reuse=qk0_buf,
+        reuse=qk0_p0_storage_alias,
     )
     p1_buf = tlx.local_alloc(
         (BLOCK_M // 2, BLOCK_N // NUM_SUBSLICES),
         dtype,
         NUM_SUBSLICES,
         tlx.storage_kind.tmem,
-        reuse=qk1_buf,
+        reuse=qk1_p1_storage_alias,
     )
+    if NUM_BUFFERS_QK == 1 and NUM_SUBSLICES <= 2:
+        qk0_p0_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                qk0_buf,
+                tlx.reuse_group(p0_buf, group_size=NUM_SUBSLICES),
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
+        qk1_p1_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                qk1_buf,
+                tlx.reuse_group(p1_buf, group_size=NUM_SUBSLICES),
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
     o0_buf = tlx.local_alloc(
         (BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem
     )
@@ -2856,11 +2936,17 @@ def gdpa_kernel_tma_ws_blackwell_short_kv(
     # allocate tmem for outputs of 4 dots (after partitioning)
     # qk0 = q0 @ k, qk1 = q1 @ k, p0 = act (qk0), p1 = act (qk1)
     # acc0 = p0 @ v, acc1 = p1 @ v
+    # P (subtiled 1x -> NUM_SUBSLICES buffers) shares its QK backing. The
+    # group_size tree below is only valid for single-buffered QK with <= 2
+    # slices (wider subtiling overflows the tree's index math); other
+    # configs keep the legacy identity layout via a bare spec.
+    qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_buf = tlx.local_alloc(
         (BLOCK_M, BLOCK_N),
         tl.float32,
         1,
         tlx.storage_kind.tmem,
+        reuse=qk_p_storage_alias,
     )
     # qk1_buf = tlx.local_alloc(
     #     (BLOCK_M // 2, BLOCK_N),
@@ -2873,8 +2959,16 @@ def gdpa_kernel_tma_ws_blackwell_short_kv(
         dtype,
         NUM_SUBSLICES,
         tlx.storage_kind.tmem,
-        reuse=qk_buf,
+        reuse=qk_p_storage_alias,
     )
+    if NUM_BUFFERS_QK == 1 and NUM_SUBSLICES <= 2:
+        qk_p_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_buf,
+                tlx.reuse_group(p_buf, group_size=NUM_SUBSLICES),
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
     # p1_buf = tlx.local_alloc(
     #     (BLOCK_M // 2, BLOCK_N // NUM_SUBSLICES),
     #     dtype,
@@ -5836,8 +5930,20 @@ def gdpa_backward_tlx(
     tile_idx = prog_id
 
     # allocate smem buffers
-    k_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_D), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    v_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_D), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
+    k_sdk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    v_sdv_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    k_tiles = tlx.local_alloc(
+        (BLOCK_N1, BLOCK_D),
+        tlx.dtype_of(desc_k),
+        NUM_BUFFERS_KV,
+        reuse=k_sdk_storage_alias,
+    )
+    v_tiles = tlx.local_alloc(
+        (BLOCK_N1, BLOCK_D),
+        tlx.dtype_of(desc_v),
+        NUM_BUFFERS_KV,
+        reuse=v_sdv_storage_alias,
+    )
     q_tiles = tlx.local_alloc((BLOCK_M1, BLOCK_D), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     do_tiles = tlx.local_alloc(
         (BLOCK_M1, BLOCK_D), tlx.dtype_of(desc_do), NUM_BUFFERS_DO
@@ -5858,14 +5964,27 @@ def gdpa_backward_tlx(
             (BLOCK_N1, DKV_STORE_NCOL),
             tlx.dtype_of(desc_dv),
             NUM_BUFFERS_KV,
-            reuse=v_tiles if HEAD_DIM == 128 else None,
+            reuse=v_sdv_storage_alias if HEAD_DIM == 128 else None,
         )
         sdk_store_buf = tlx.local_alloc(
             (BLOCK_N1, DKV_STORE_NCOL),
             tlx.dtype_of(desc_dk),
             NUM_BUFFERS_KV,
-            reuse=k_tiles if HEAD_DIM == 128 else None,
+            reuse=k_sdk_storage_alias if HEAD_DIM == 128 else None,
         )
+        # Staging aliases k/v SMEM only at HEAD_DIM == 128; otherwise each
+        # buffer keeps its own backing (legacy `reuse=None` behavior).
+        if HEAD_DIM == 128:
+            v_sdv_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    v_tiles, sdv_store_buf, group_type=tlx.reuse_group_type.shared
+                )
+            )
+            k_sdk_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    k_tiles, sdk_store_buf, group_type=tlx.reuse_group_type.shared
+                )
+            )
     else:
         sdv_store_buf = None
         sdk_store_buf = None
@@ -5969,15 +6088,23 @@ def gdpa_backward_tlx(
         dw_scratch_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DW_SCRATCH)
 
     # allocate tmem buffers
+    qk_ppT_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc(
-        (BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem
+        (BLOCK_N1, BLOCK_M1),
+        tl.float32,
+        NUM_BUFFERS_TMEM,
+        tlx.storage_kind.tmem,
+        reuse=qk_ppT_storage_alias,
     )
     ppT_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_ppT_storage_alias,
+    )
+    qk_ppT_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(qk_tiles, ppT_tiles, group_type=tlx.reuse_group_type.shared)
     )
     dv_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_D), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem
@@ -5985,16 +6112,27 @@ def gdpa_backward_tlx(
     dk_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_D), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem
     )
+    dq_dpT_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dq_tiles = tlx.local_alloc(
-        (BLOCK_M1, BLOCK_D), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem
+        (BLOCK_M1, BLOCK_D),
+        tl.float32,
+        NUM_BUFFERS_TMEM,
+        tlx.storage_kind.tmem,
+        reuse=dq_dpT_storage_alias,
     )
     dpT_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=dq_tiles if not FUSED_LAYERNORM else None,
+        reuse=dq_dpT_storage_alias if not FUSED_LAYERNORM else None,
     )
+    # dP aliases dQ TMEM except under fused layernorm, where it keeps its
+    # own backing (legacy `reuse=None` behavior).
+    if not FUSED_LAYERNORM:
+        dq_dpT_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(dq_tiles, dpT_tiles, group_type=tlx.reuse_group_type.shared)
+        )
 
     # allocate barriers for tmem buffers
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)

@@ -459,21 +459,31 @@ def _attn_bwd_ws(  # noqa: C901, TR001
     ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
     # allocate tmem buffers
+    qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc(
-        (BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem
+        (BLOCK_N1, BLOCK_M1),
+        tl.float32,
+        NUM_BUFFERS_TMEM,
+        tlx.storage_kind.tmem,
+        reuse=qk_p_storage_alias,
     )
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_storage_alias,
     )
+    qk_p_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(qk_tiles, p_tiles, group_type=tlx.reuse_group_type.shared)
+    )
+    dp_dq_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
+        reuse=dp_dq_storage_alias,
     )
 
     dq_tiles = tlx.local_alloc(
@@ -481,7 +491,10 @@ def _attn_bwd_ws(  # noqa: C901, TR001
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=dp_tiles,
+        reuse=dp_dq_storage_alias,
+    )
+    dp_dq_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(dp_tiles, dq_tiles, group_type=tlx.reuse_group_type.shared)
     )
     dv_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_D), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem

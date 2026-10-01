@@ -319,7 +319,7 @@ def _softmax_inner_iter(
     else:
         alpha = tl.math.exp2(m_i - m_ij)
     tlx.barrier_wait(alpha_empties[cid], qk_phase ^ 1)
-    tlx.local_store(alpha_tiles[cid * BLOCK_N], alpha[:, None])
+    tlx.local_store(alpha_tiles[cid], alpha[:, None])
     tlx.barrier_arrive(alpha_fulls[cid])
 
     if RESCALE_OPT:
@@ -330,7 +330,7 @@ def _softmax_inner_iter(
     qks = _split_n(qk, NUM_MMA_SLICES)
     ps = ()
     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-        p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+        p_bufIdx = cid * NUM_MMA_SLICES + slice_id
         p_i = tl.math.exp2(qks[slice_id])
         tlx.local_store(p_tiles[p_bufIdx], p_i.to(out_dtype))
         tlx.barrier_arrive(p_fulls[slice_id + cid * NUM_MMA_SLICES])
@@ -467,8 +467,13 @@ def _attn_fwd_ws(  # noqa: C901, TR001
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     # allocate TMEM buffers and barriers
+    qk_p_l_m_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem
+        (BLOCK_M_SPLIT, BLOCK_N),
+        tl.float32,
+        NUM_MMA_GROUPS,
+        tlx.storage_kind.tmem,
+        reuse=qk_p_l_m_storage_alias,
     )
     # Shared buffer for QK, P and Alpha, l, and m.
     # A single QK buffer is split evenly:
@@ -482,30 +487,44 @@ def _attn_fwd_ws(  # noqa: C901, TR001
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
         tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS * NUM_MMA_SLICES * 2,
+        NUM_MMA_GROUPS * NUM_MMA_SLICES,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_l_m_storage_alias,
     )
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_l_m_storage_alias,
     )
     l_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_l_m_storage_alias,
     )
     m_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_p_l_m_storage_alias,
+    )
+    # QK shares each group with P's slices plus alpha/l/m packed after them.
+    qk_p_l_m_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            qk_tiles,
+            tlx.reuse_group(
+                tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
+                alpha_tiles,
+                l_tiles,
+                m_tiles,
+                group_type=tlx.reuse_group_type.distinct,
+            ),
+            group_type=tlx.reuse_group_type.shared,
+        )
     )
 
     acc_tiles = tlx.local_alloc(
@@ -571,7 +590,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                             # -- update output accumulator --
                             tlx.barrier_wait(alpha_fulls[cid], phase)
                             # Use alpha[0] for cid=0, and alpha[HEAD_DIM] for cid=1
-                            alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
+                            alpha_1 = tlx.local_load(alpha_tiles[cid])
                             tlx.barrier_arrive(alpha_empties[cid])
                             # Ballot skip: when alpha was forced to 1.0
                             # in the softmax warp (no row needs rescale), skip the
@@ -606,8 +625,8 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                         tlx.barrier_wait(l_fulls[cid], phase)
                         # Use l[1]/l[1+HEAD_DIM] and m[2][2 + HEAD_DIM]
                         # to disambigulate from alpha[0]/alpha[HEAD_DIM]
-                        l_i_epilogue = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
-                        m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
+                        l_i_epilogue = tlx.local_load(l_tiles[cid])
+                        m = tlx.local_load(m_tiles[cid])
                         tlx.barrier_arrive(qk_empties[cid])
                         # When RESCALE_OPT is on, m_tiles holds UNSCALED row-max.
                         # The bwd kernel reads logsumexp = (m * sm_scale * log2_e)
@@ -807,8 +826,8 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                     # prepare l_i for the epilog
                     # Use l[1]/l[1+HEAD_DIM] and m[2][2 + HEAD_DIM]
                     # to disambigulate from alpha[0]/alpha[HEAD_DIM]
-                    tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
-                    tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
+                    tlx.local_store(l_tiles[cid], l_i[:, None])
+                    tlx.local_store(m_tiles[cid], m_i[:, None])
                     tlx.barrier_arrive(l_fulls[cid])
                 i += 1
                 if USE_CLC:
@@ -902,8 +921,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                     # wait for the V buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
                     tlx.barrier_wait(acc_fulls[0], qk_phase)
-                    # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
-                    # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
+                    # Use p[slice_id] for cid=0, and p[NUM_MMA_SLICES + slice_id] for cid=1
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         tlx.barrier_wait(
                             p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase
@@ -913,7 +931,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                         )
-                        p_bufIdx = NUM_MMA_SLICES + slice_id
+                        p_bufIdx = slice_id
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -963,11 +981,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                                 [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                             )
-                            p_bufIdx = (
-                                1 * NUM_MMA_GROUPS * NUM_MMA_SLICES
-                                + NUM_MMA_SLICES
-                                + slice_id
-                            )
+                            p_bufIdx = NUM_MMA_SLICES + slice_id
                             use_acc = acc1_init if slice_id == 0 else True
                             mBarriers = (
                                 [kv_empties[v_bufIdx_prev]]
@@ -1009,7 +1023,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                                 [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                             )
-                            p_bufIdx = NUM_MMA_SLICES + slice_id
+                            p_bufIdx = slice_id
                             tlx.async_dot(
                                 p_tiles[p_bufIdx],
                                 kv_slice,
@@ -1032,11 +1046,7 @@ def _attn_fwd_ws(  # noqa: C901, TR001
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                         )
-                        p_bufIdx = (
-                            1 * NUM_MMA_GROUPS * NUM_MMA_SLICES
-                            + NUM_MMA_SLICES
-                            + slice_id
-                        )
+                        p_bufIdx = NUM_MMA_SLICES + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
                         mBarriers = (
                             [acc_empties[1], kv_empties[v_bufIdx]]
@@ -2268,11 +2278,19 @@ def _attn_bwd_ws_2cta(  # noqa: C901, TR001
     # =====================================================================
     # SMEM + TMEM buffers
     # =====================================================================
+    k_sdk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
     k_tiles = tlx.local_alloc(
-        (BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV
+        (BLOCK_N1, HEAD_DIM),
+        tlx.dtype_of(desc_k),
+        NUM_BUFFERS_KV,
+        reuse=k_sdk_storage_alias,
     )
+    v_sdv_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
     v_tiles = tlx.local_alloc(
-        (BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV
+        (BLOCK_N1, HEAD_DIM),
+        tlx.dtype_of(desc_v),
+        NUM_BUFFERS_KV,
+        reuse=v_sdv_storage_alias,
     )
     q_tiles = tlx.local_alloc(
         (BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q
@@ -2303,10 +2321,22 @@ def _attn_bwd_ws_2cta(  # noqa: C901, TR001
     dq_store_buf = tlx.local_alloc((DQ_STORE_M, DQ_SLICE_N), tlx.dtype_of(desc_dq), 2)
     # dK/dV epilogue staging (reuse k/v SMEM to fit budget).
     sdv_store_buf = tlx.local_alloc(
-        (BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_v), NUM_BUFFERS_KV, reuse=v_tiles
+        (BLOCK_N1, DKV_STORE_NCOL),
+        tlx.dtype_of(desc_v),
+        NUM_BUFFERS_KV,
+        reuse=v_sdv_storage_alias,
     )
     sdk_store_buf = tlx.local_alloc(
-        (BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_k), NUM_BUFFERS_KV, reuse=k_tiles
+        (BLOCK_N1, DKV_STORE_NCOL),
+        tlx.dtype_of(desc_k),
+        NUM_BUFFERS_KV,
+        reuse=k_sdk_storage_alias,
+    )
+    v_sdv_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(v_tiles, sdv_store_buf, group_type=tlx.reuse_group_type.shared)
+    )
+    k_sdk_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(k_tiles, sdk_store_buf, group_type=tlx.reuse_group_type.shared)
     )
 
     # S/P/dQ share TMEM. P offset to column 64; dQ at column 0.
