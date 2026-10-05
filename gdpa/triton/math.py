@@ -18,6 +18,7 @@ This file defines common math functions, sometimes relying on optimized PTX for 
 will only be supported on NVIDIA GPUs
 """
 
+from collections.abc import Callable
 from enum import Enum
 from typing import Optional
 
@@ -55,7 +56,9 @@ class Activation(str, Enum):
     FastGeLUTaylorApprox = "fast_gelu_taylor_approx"
 
 
-def get_pytorch_activation(activation: Activation):
+def get_pytorch_activation(
+    activation: Activation,
+) -> torch.nn.Module | Callable[[torch.Tensor], torch.Tensor]:
     return {
         Activation.ReLU: torch.nn.ReLU(),
         Activation.LeakyReLU: torch.nn.LeakyReLU(),
@@ -97,12 +100,12 @@ def is_mtia_or_a100() -> bool:
 
 
 @triton.jit  # pragma: no cover
-def raw(x):
+def raw(x: tl.tensor) -> tl.tensor:
     return x
 
 
 @triton.jit  # pragma: no cover
-def raw_grad(x):
+def raw_grad(x: tl.tensor) -> tl.tensor:
     return tl.full(x.shape, 1.0, x.dtype)
 
 
@@ -113,7 +116,7 @@ def tanh(x: tl.tensor) -> tl.tensor:
 
 
 @triton.jit  # pragma: no cover
-def relu(x):
+def relu(x: tl.tensor) -> tl.tensor:
     zero = 0.0
     return tl.where(x >= 0, x, zero.to(x.dtype))  # type: ignore
 
@@ -186,12 +189,12 @@ else:
 
 
 @triton.jit  # pragma: no cover
-def gelu_approx(x):
+def gelu_approx(x: tl.tensor) -> tl.tensor:
     return 0.5 * x * (1.0 + tanh(0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
 
 @triton.jit  # pragma: no cover
-def gelu_approx_grad(x):
+def gelu_approx_grad(x: tl.tensor) -> tl.tensor:
     tanh_out = tanh(0.7978845608 * x * (1 + 0.044715 * x * x))
     return 0.5 * x * (
         (1 - tanh_out * tanh_out) * (0.7978845608 + 0.1070322243 * x * x)
@@ -201,21 +204,21 @@ def gelu_approx_grad(x):
 if is_mtia_or_a100():
     # For MTIA or A100, use tanh as a fallback
     @triton.jit  # pragma: no cover
-    def tanh_approx_fp32(x):
+    def tanh_approx_fp32(x: tl.tensor) -> tl.tensor:
         return tanh(x)
 
     @triton.jit  # pragma: no cover
-    def tanh_approx_bf16(x):
+    def tanh_approx_bf16(x: tl.tensor) -> tl.tensor:
         x32 = x.to(tl.float32)
         y = tanh(x32)
         return y.to(tl.bfloat16)
 
     @triton.jit  # pragma: no cover
-    def sigmoid_approx_fp32(x):
+    def sigmoid_approx_fp32(x: tl.tensor) -> tl.tensor:
         return tl.sigmoid(x)
 
     @triton.jit  # pragma: no cover
-    def sigmoid_approx_bf16(x):
+    def sigmoid_approx_bf16(x: tl.tensor) -> tl.tensor:
         x32 = x.to(tl.float32)
         y = tl.sigmoid(x32)
         return y.to(tl.bfloat16)
@@ -223,21 +226,21 @@ if is_mtia_or_a100():
 elif is_amd():
 
     @triton.jit
-    def sigmoid_approx_fp32(x):
+    def sigmoid_approx_fp32(x: tl.tensor) -> tl.tensor:
         return fast_dividef(1.0, 1.0 + fast_expf(-x))
 
     @triton.jit
-    def sigmoid_approx_bf16(x):
+    def sigmoid_approx_bf16(x: tl.tensor) -> tl.tensor:
         x32 = x.to(tl.float32)
         y = sigmoid_approx_fp32(x32)
         return y.to(tl.bfloat16)
 
     @triton.jit
-    def tanh_approx_fp32(x):
+    def tanh_approx_fp32(x: tl.tensor) -> tl.tensor:
         return 2 * sigmoid_approx_fp32(2 * x) - 1
 
     @triton.jit
-    def tanh_approx_bf16(x):
+    def tanh_approx_bf16(x: tl.tensor) -> tl.tensor:
         return 2 * sigmoid_approx_bf16(2 * x) - 1
 
 else:
@@ -271,12 +274,12 @@ else:
         return output
 
     @triton.jit  # pragma: no cover
-    def sigmoid_approx_fp32(x):
+    def sigmoid_approx_fp32(x: tl.tensor) -> tl.tensor:
         output = 0.5 * tanh_approx_fp32(0.5 * x) + 0.5
         return output
 
     @triton.jit  # pragma: no cover
-    def sigmoid_approx_bf16(x):
+    def sigmoid_approx_bf16(x: tl.tensor) -> tl.tensor:
         output = 0.5 * tanh_approx_bf16(0.5 * x) + 0.5
         # output = fast_dividef(1.0, 1.0 + fast_expf(-x))
         return output
@@ -290,7 +293,7 @@ if is_mtia():
         return libdevice.dgelu(x)
 
     @triton.jit
-    def fast_gelu_joint(x):
+    def fast_gelu_joint(x: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
         k = 0.7978845608
         tanh_out = tanh_approx_fp32(x * (k + k * 0.044715 * x * x))
         return x * 0.5 * (1 + tanh_out), tanh_out
@@ -298,14 +301,14 @@ if is_mtia():
 elif is_amd():
 
     @triton.jit
-    def fast_gelu_joint(x):
+    def fast_gelu_joint(x: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
         k = 2.0 * 0.7978845608
         sigmoid_out = sigmoid_approx_fp32(x * (k + k * 0.044715 * x * x))
         tanh_out = 2 * sigmoid_out - 1  # Convert sigmoid back to tanh
         return x * sigmoid_out, tanh_out
 
     @triton.jit
-    def fast_gelu_grad(x):
+    def fast_gelu_grad(x: tl.tensor) -> tl.tensor:
         # sig = sigmoid(2u), where u = 0.7978845608 * x * (1.0 + 0.044715 * x * x)
         k = 2.0 * 0.7978845608
         sig_out = sigmoid_approx_fp32(k * x * (1.0 + 0.044715 * x * x))
@@ -317,26 +320,26 @@ elif is_amd():
 else:
 
     @triton.jit  # pragma: no cover
-    def fast_gelu_grad(x):
+    def fast_gelu_grad(x: tl.tensor) -> tl.tensor:
         tanh_out = tanh_approx_fp32(0.7978845608 * x * (1.0 + 0.044715 * x * x))
         return 0.5 * x * (
             (1 - tanh_out * tanh_out) * (0.7978845608 + 0.1070322243 * x * x)
         ) + 0.5 * (1 + tanh_out)
 
     @triton.jit
-    def fast_gelu_joint(x):
+    def fast_gelu_joint(x: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
         k = 0.7978845608
         tanh_out = tanh_approx_fp32(x * (k + k * 0.044715 * x * x))
         return x * 0.5 * (1 + tanh_out), tanh_out
 
 
 @triton.jit  # pragma: no cover
-def fast_gelu(x):
+def fast_gelu(x: tl.tensor) -> tl.tensor:
     return fast_gelu_joint(x)[0]
 
 
 @triton.jit  # pragma: no cover
-def fast_gelu_bf16(x):
+def fast_gelu_bf16(x: tl.tensor) -> tl.tensor:
     return x * 0.5 * (1 + tanh_approx_bf16(0.796875 * x * (1.0 + 0.044715 * x * x)))
 
 
@@ -349,23 +352,23 @@ def fast_gelu_bf16_grad(x: tl.tensor) -> tl.tensor:
 
 
 @triton.jit  # pragma: no cover
-def silu(x):
+def silu(x: tl.tensor) -> tl.tensor:
     return x * tl.sigmoid(x)
 
 
 @triton.jit  # pragma: no cover
-def silu_grad(x):
+def silu_grad(x: tl.tensor) -> tl.tensor:
     sig = tl.sigmoid(x)
     return sig * (1 + x * (1 - sig))
 
 
 @triton.jit  # pragma: no cover
-def fast_silu(x):
+def fast_silu(x: tl.tensor) -> tl.tensor:
     return fast_dividef(x, 1.0 + fast_expf(-x))
 
 
 @triton.jit  # pragma: no cover
-def fast_silu_grad(x):
+def fast_silu_grad(x: tl.tensor) -> tl.tensor:
     sig = fast_dividef(1.0, 1.0 + fast_expf(-x))
     return sig * (1 + x * (1 - sig))
 
